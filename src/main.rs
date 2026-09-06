@@ -397,14 +397,46 @@ impl BiliLiveTool {
         -1
     }
 
-    async fn stop_live(&self, room_id: u64) {
+    async fn stop_live(&self, room_id: u64) -> Result<(), String> {
         let url = "https://api.live.bilibili.com/room/v1/Room/stopLive";
         let form = vec![
             ("room_id", room_id.to_string()),
+            ("platform", "pc_link".to_string()),
             ("csrf_token", self.csrf.clone()),
             ("csrf", self.csrf.clone()),
         ];
-        let _ = self.client.post(url).form(&form).headers(self.build_headers()).send().await;
+
+        let res = self
+            .client
+            .post(url)
+            .form(&form)
+            .headers(self.build_headers())
+            .send()
+            .await
+            .map_err(|e| format!("网络请求失败: {}", e))?;
+        let http_status = res.status();
+        let body = res
+            .text()
+            .await
+            .map_err(|e| format!("读取接口响应失败: {}", e))?;
+
+        if !http_status.is_success() {
+            return Err(format!("HTTP {}", http_status));
+        }
+
+        let json: Value = serde_json::from_str(&body)
+            .map_err(|_| format!("接口返回内容不是有效 JSON（HTTP {}）", http_status))?;
+        let code_is_zero = json["code"].as_i64() == Some(0) || json["code"].as_str() == Some("0");
+        if code_is_zero {
+            Ok(())
+        } else {
+            let code = json["code"].to_string();
+            let message = json["message"]
+                .as_str()
+                .or_else(|| json["msg"].as_str())
+                .unwrap_or("未知错误");
+            Err(format!("接口返回 code={}：{}", code, message))
+        }
     }
 
     async fn check_face_auth_status(&self, room_id: u64) -> bool {
@@ -589,22 +621,17 @@ async fn main() {
         }
     };
 
-    // Handle Ctrl-C gracefully
-    let csrf_clone = tool.csrf.clone();
-    let client_clone = tool.client.clone();
-    tokio::spawn(async move {
-        if let Ok(_) = tokio::signal::ctrl_c().await {
-            let url = "https://api.live.bilibili.com/room/v1/Room/stopLive";
-            let form = vec![
-                ("room_id", room_id.to_string()),
-                ("csrf_token", csrf_clone.clone()),
-                ("csrf", csrf_clone),
-            ];
-            let _ = client_clone.post(url).form(&form).send().await;
-            println!("✅ 已下播");
-            std::process::exit(0);
-        }
-    });
+    // Handle Ctrl-C gracefully. Run the monitor and signal listener together so the
+    // stop request uses the tool's current cookies and CSRF token.
+    let interrupted = tokio::select! {
+        _ = tool.run_live(room_id, area_id, title, args.no_heartbeat, args.continuous) => false,
+        result = tokio::signal::ctrl_c() => result.is_ok(),
+    };
 
-    tool.run_live(room_id, area_id, title, args.no_heartbeat, args.continuous).await;
+    if interrupted {
+        match tool.stop_live(room_id).await {
+            Ok(()) => tool._emit("info", Some("✅ 已下播"), None),
+            Err(e) => tool._emit("error", Some(&format!("下播失败: {}", e)), None),
+        }
+    }
 }
